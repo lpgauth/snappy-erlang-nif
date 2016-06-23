@@ -82,7 +82,6 @@ enum {
   COPY_2_BYTE_OFFSET = 2,
   COPY_4_BYTE_OFFSET = 3
 };
-static const int kMaximumTagLength = 5;  // COPY_4_BYTE_OFFSET plus the actual offset.
 
 // Copy "len" bytes from "src" to "op", one byte at a time.  Used for
 // handling COPY operations where the input and output regions may
@@ -95,7 +94,7 @@ static const int kMaximumTagLength = 5;  // COPY_4_BYTE_OFFSET plus the actual o
 //    ababababababababababab
 // Note that this does not match the semantics of either memcpy()
 // or memmove().
-static inline void IncrementalCopy(const char* src, char* op, ssize_t len) {
+static inline void IncrementalCopy(const char* src, char* op, int len) {
   assert(len > 0);
   do {
     *op++ = *src++;
@@ -137,8 +136,10 @@ namespace {
 
 const int kMaxIncrementCopyOverflow = 10;
 
-inline void IncrementalCopyFastPath(const char* src, char* op, ssize_t len) {
-  while (PREDICT_FALSE(op - src < 8)) {
+}  // namespace
+
+static inline void IncrementalCopyFastPath(const char* src, char* op, int len) {
+  while (op - src < 8) {
     UnalignedCopy64(src, op);
     len -= op - src;
     op += op - src;
@@ -150,8 +151,6 @@ inline void IncrementalCopyFastPath(const char* src, char* op, ssize_t len) {
     len -= 8;
   }
 }
-
-}  // namespace
 
 static inline char* EmitLiteral(char* op,
                                 const char* literal,
@@ -215,7 +214,7 @@ static inline char* EmitCopyLessThan64(char* op, size_t offset, int len) {
 
 static inline char* EmitCopy(char* op, size_t offset, int len) {
   // Emit 64 byte copies but make sure to keep at least four bytes reserved
-  while (PREDICT_FALSE(len >= 68)) {
+  while (len >= 68) {
     op = EmitCopyLessThan64(op, offset, 64);
     len -= 64;
   }
@@ -470,26 +469,21 @@ char* CompressFragment(const char* input,
 //   bool Append(const char* ip, size_t length);
 //   bool AppendFromSelf(uint32 offset, size_t length);
 //
-//   // The rules for how TryFastAppend differs from Append are somewhat
-//   // convoluted:
+//   // The difference between TryFastAppend and Append is that TryFastAppend
+//   // is allowed to read up to <available> bytes from the input buffer,
+//   // whereas Append is allowed to read <length>.
 //   //
-//   //  - TryFastAppend is allowed to decline (return false) at any
-//   //    time, for any reason -- just "return false" would be
-//   //    a perfectly legal implementation of TryFastAppend.
-//   //    The intention is for TryFastAppend to allow a fast path
-//   //    in the common case of a small append.
-//   //  - TryFastAppend is allowed to read up to <available> bytes
-//   //    from the input buffer, whereas Append is allowed to read
-//   //    <length>. However, if it returns true, it must leave
-//   //    at least five (kMaximumTagLength) bytes in the input buffer
-//   //    afterwards, so that there is always enough space to read the
-//   //    next tag without checking for a refill.
-//   //  - TryFastAppend must always return decline (return false)
-//   //    if <length> is 61 or more, as in this case the literal length is not
-//   //    decoded fully. In practice, this should not be a big problem,
-//   //    as it is unlikely that one would implement a fast path accepting
-//   //    this much data.
+//   // Also, TryFastAppend is allowed to return false, declining the append,
+//   // without it being a fatal error -- just "return false" would be
+//   // a perfectly legal implementation of TryFastAppend. The intention
+//   // is for TryFastAppend to allow a fast path in the common case of
+//   // a small append.
 //   //
+//   // NOTE(user): TryFastAppend must always return decline (return false)
+//   // if <length> is 61 or more, as in this case the literal length is not
+//   // decoded fully. In practice, this should not be a big problem,
+//   // as it is unlikely that one would implement a fast path accepting
+//   // this much data.
 //   bool TryFastAppend(const char* ip, size_t available, size_t length);
 // };
 
@@ -658,7 +652,7 @@ class SnappyDecompressor {
   const char*   ip_limit_;       // Points just past buffered bytes
   uint32        peeked_;         // Bytes peeked from reader (need to skip)
   bool          eof_;            // Hit end of input without an error?
-  char          scratch_[kMaximumTagLength];  // See RefillTag().
+  char          scratch_[5];     // Temporary buffer for PeekFast() boundaries
 
   // Ensure that all of the tag metadata for the next tag is available
   // in [ip_..ip_limit_-1].  Also ensures that [ip,ip+4] is readable even
@@ -721,7 +715,7 @@ class SnappyDecompressor {
     // scope to optimize the <ip_limit_ - ip> expression based on the local
     // context, which overall increases speed.
     #define MAYBE_REFILL() \
-        if (ip_limit_ - ip < kMaximumTagLength) { \
+        if (ip_limit_ - ip < 5) { \
           ip_ = ip; \
           if (!RefillTag()) return; \
           ip = ip_; \
@@ -736,9 +730,7 @@ class SnappyDecompressor {
         if (writer->TryFastAppend(ip, ip_limit_ - ip, literal_length)) {
           assert(literal_length < 61);
           ip += literal_length;
-          // NOTE(user): There is no MAYBE_REFILL() here, as TryFastAppend()
-          // will not return true unless there's already at least five spare
-          // bytes in addition to the literal.
+          MAYBE_REFILL();
           continue;
         }
         if (PREDICT_FALSE(literal_length >= 61)) {
@@ -831,7 +823,7 @@ bool SnappyDecompressor::RefillTag() {
     assert(nbuf == needed);
     ip_ = scratch_;
     ip_limit_ = scratch_ + needed;
-  } else if (nbuf < kMaximumTagLength) {
+  } else if (nbuf < 5) {
     // Have enough bytes, but move into scratch_ so that we do not
     // read past end of input
     memmove(scratch_, ip, nbuf);
@@ -847,23 +839,31 @@ bool SnappyDecompressor::RefillTag() {
 }
 
 template <typename Writer>
-static bool InternalUncompress(Source* r, Writer* writer) {
+static bool InternalUncompress(Source* r,
+                               Writer* writer,
+                               uint32 max_len) {
   // Read the uncompressed length from the front of the compressed input
   SnappyDecompressor decompressor(r);
   uint32 uncompressed_len = 0;
   if (!decompressor.ReadUncompressedLength(&uncompressed_len)) return false;
-  return InternalUncompressAllTags(&decompressor, writer, uncompressed_len);
+  return InternalUncompressAllTags(
+      &decompressor, writer, uncompressed_len, max_len);
 }
 
 template <typename Writer>
 static bool InternalUncompressAllTags(SnappyDecompressor* decompressor,
                                       Writer* writer,
-                                      uint32 uncompressed_len) {
+                                      uint32 uncompressed_len,
+                                      uint32 max_len) {
+  // Protect against possible DoS attack
+  if (static_cast<uint64>(uncompressed_len) > max_len) {
+    return false;
+  }
+
   writer->SetExpectedLength(uncompressed_len);
 
   // Process the entire input
   decompressor->DecompressAllTags(writer);
-  writer->Flush();
   return (decompressor->eof() && writer->CheckLength());
 }
 
@@ -954,184 +954,6 @@ size_t Compress(Source* reader, Sink* writer) {
 }
 
 // -----------------------------------------------------------------------
-// IOVec interfaces
-// -----------------------------------------------------------------------
-
-// A type that writes to an iovec.
-// Note that this is not a "ByteSink", but a type that matches the
-// Writer template argument to SnappyDecompressor::DecompressAllTags().
-class SnappyIOVecWriter {
- private:
-  const struct iovec* output_iov_;
-  const size_t output_iov_count_;
-
-  // We are currently writing into output_iov_[curr_iov_index_].
-  int curr_iov_index_;
-
-  // Bytes written to output_iov_[curr_iov_index_] so far.
-  size_t curr_iov_written_;
-
-  // Total bytes decompressed into output_iov_ so far.
-  size_t total_written_;
-
-  // Maximum number of bytes that will be decompressed into output_iov_.
-  size_t output_limit_;
-
-  inline char* GetIOVecPointer(int index, size_t offset) {
-    return reinterpret_cast<char*>(output_iov_[index].iov_base) +
-        offset;
-  }
-
- public:
-  // Does not take ownership of iov. iov must be valid during the
-  // entire lifetime of the SnappyIOVecWriter.
-  inline SnappyIOVecWriter(const struct iovec* iov, size_t iov_count)
-      : output_iov_(iov),
-        output_iov_count_(iov_count),
-        curr_iov_index_(0),
-        curr_iov_written_(0),
-        total_written_(0),
-        output_limit_(-1) {
-  }
-
-  inline void SetExpectedLength(size_t len) {
-    output_limit_ = len;
-  }
-
-  inline bool CheckLength() const {
-    return total_written_ == output_limit_;
-  }
-
-  inline bool Append(const char* ip, size_t len) {
-    if (total_written_ + len > output_limit_) {
-      return false;
-    }
-
-    while (len > 0) {
-      assert(curr_iov_written_ <= output_iov_[curr_iov_index_].iov_len);
-      if (curr_iov_written_ >= output_iov_[curr_iov_index_].iov_len) {
-        // This iovec is full. Go to the next one.
-        if (curr_iov_index_ + 1 >= output_iov_count_) {
-          return false;
-        }
-        curr_iov_written_ = 0;
-        ++curr_iov_index_;
-      }
-
-      const size_t to_write = std::min(
-          len, output_iov_[curr_iov_index_].iov_len - curr_iov_written_);
-      memcpy(GetIOVecPointer(curr_iov_index_, curr_iov_written_),
-             ip,
-             to_write);
-      curr_iov_written_ += to_write;
-      total_written_ += to_write;
-      ip += to_write;
-      len -= to_write;
-    }
-
-    return true;
-  }
-
-  inline bool TryFastAppend(const char* ip, size_t available, size_t len) {
-    const size_t space_left = output_limit_ - total_written_;
-    if (len <= 16 && available >= 16 + kMaximumTagLength && space_left >= 16 &&
-        output_iov_[curr_iov_index_].iov_len - curr_iov_written_ >= 16) {
-      // Fast path, used for the majority (about 95%) of invocations.
-      char* ptr = GetIOVecPointer(curr_iov_index_, curr_iov_written_);
-      UnalignedCopy64(ip, ptr);
-      UnalignedCopy64(ip + 8, ptr + 8);
-      curr_iov_written_ += len;
-      total_written_ += len;
-      return true;
-    }
-
-    return false;
-  }
-
-  inline bool AppendFromSelf(size_t offset, size_t len) {
-    if (offset > total_written_ || offset == 0) {
-      return false;
-    }
-    const size_t space_left = output_limit_ - total_written_;
-    if (len > space_left) {
-      return false;
-    }
-
-    // Locate the iovec from which we need to start the copy.
-    int from_iov_index = curr_iov_index_;
-    size_t from_iov_offset = curr_iov_written_;
-    while (offset > 0) {
-      if (from_iov_offset >= offset) {
-        from_iov_offset -= offset;
-        break;
-      }
-
-      offset -= from_iov_offset;
-      --from_iov_index;
-      assert(from_iov_index >= 0);
-      from_iov_offset = output_iov_[from_iov_index].iov_len;
-    }
-
-    // Copy <len> bytes starting from the iovec pointed to by from_iov_index to
-    // the current iovec.
-    while (len > 0) {
-      assert(from_iov_index <= curr_iov_index_);
-      if (from_iov_index != curr_iov_index_) {
-        const size_t to_copy = std::min(
-            output_iov_[from_iov_index].iov_len - from_iov_offset,
-            len);
-        Append(GetIOVecPointer(from_iov_index, from_iov_offset), to_copy);
-        len -= to_copy;
-        if (len > 0) {
-          ++from_iov_index;
-          from_iov_offset = 0;
-        }
-      } else {
-        assert(curr_iov_written_ <= output_iov_[curr_iov_index_].iov_len);
-        size_t to_copy = std::min(output_iov_[curr_iov_index_].iov_len -
-                                      curr_iov_written_,
-                                  len);
-        if (to_copy == 0) {
-          // This iovec is full. Go to the next one.
-          if (curr_iov_index_ + 1 >= output_iov_count_) {
-            return false;
-          }
-          ++curr_iov_index_;
-          curr_iov_written_ = 0;
-          continue;
-        }
-        if (to_copy > len) {
-          to_copy = len;
-        }
-        IncrementalCopy(GetIOVecPointer(from_iov_index, from_iov_offset),
-                        GetIOVecPointer(curr_iov_index_, curr_iov_written_),
-                        to_copy);
-        curr_iov_written_ += to_copy;
-        from_iov_offset += to_copy;
-        total_written_ += to_copy;
-        len -= to_copy;
-      }
-    }
-
-    return true;
-  }
-
-  inline void Flush() {}
-};
-
-bool RawUncompressToIOVec(const char* compressed, size_t compressed_length,
-                          const struct iovec* iov, size_t iov_cnt) {
-  ByteArraySource reader(compressed, compressed_length);
-  return RawUncompressToIOVec(&reader, iov, iov_cnt);
-}
-
-bool RawUncompressToIOVec(Source* compressed, const struct iovec* iov,
-                          size_t iov_cnt) {
-  SnappyIOVecWriter output(iov, iov_cnt);
-  return InternalUncompress(compressed, &output);
-}
-
-// -----------------------------------------------------------------------
 // Flat array interfaces
 // -----------------------------------------------------------------------
 
@@ -1147,8 +969,7 @@ class SnappyArrayWriter {
  public:
   inline explicit SnappyArrayWriter(char* dst)
       : base_(dst),
-        op_(dst),
-        op_limit_(dst) {
+        op_(dst) {
   }
 
   inline void SetExpectedLength(size_t len) {
@@ -1173,7 +994,7 @@ class SnappyArrayWriter {
   inline bool TryFastAppend(const char* ip, size_t available, size_t len) {
     char* op = op_;
     const size_t space_left = op_limit_ - op;
-    if (len <= 16 && available >= 16 + kMaximumTagLength && space_left >= 16) {
+    if (len <= 16 && available >= 16 && space_left >= 16) {
       // Fast path, used for the majority (about 95%) of invocations.
       UnalignedCopy64(ip, op);
       UnalignedCopy64(ip + 8, op + 8);
@@ -1188,16 +1009,7 @@ class SnappyArrayWriter {
     char* op = op_;
     const size_t space_left = op_limit_ - op;
 
-    // Check if we try to append from before the start of the buffer.
-    // Normally this would just be a check for "produced < offset",
-    // but "produced <= offset - 1u" is equivalent for every case
-    // except the one where offset==0, where the right side will wrap around
-    // to a very big number. This is convenient, as offset==0 is another
-    // invalid case that we also want to catch, so that we do not go
-    // into an infinite loop.
-    assert(op >= base_);
-    size_t produced = op - base_;
-    if (produced <= offset - 1u) {
+    if (op - base_ <= offset - 1u) {  // -1u catches offset==0
       return false;
     }
     if (len <= 16 && offset >= 8 && space_left >= 16) {
@@ -1218,10 +1030,6 @@ class SnappyArrayWriter {
     op_ = op + len;
     return true;
   }
-  inline size_t Produced() const {
-    return op_ - base_;
-  }
-  inline void Flush() {}
 };
 
 bool RawUncompress(const char* compressed, size_t n, char* uncompressed) {
@@ -1231,7 +1039,7 @@ bool RawUncompress(const char* compressed, size_t n, char* uncompressed) {
 
 bool RawUncompress(Source* compressed, char* uncompressed) {
   SnappyArrayWriter output(uncompressed);
-  return InternalUncompress(compressed, &output);
+  return InternalUncompress(compressed, &output, kuint32max);
 }
 
 bool Uncompress(const char* compressed, size_t n, string* uncompressed) {
@@ -1239,14 +1047,15 @@ bool Uncompress(const char* compressed, size_t n, string* uncompressed) {
   if (!GetUncompressedLength(compressed, n, &ulength)) {
     return false;
   }
-  // On 32-bit builds: max_size() < kuint32max.  Check for that instead
-  // of crashing (e.g., consider externally specified compressed data).
-  if (ulength > uncompressed->max_size()) {
+  // Protect against possible DoS attack
+  if ((static_cast<uint64>(ulength) + uncompressed->size()) >
+      uncompressed->max_size()) {
     return false;
   }
   STLStringResizeUninitialized(uncompressed, ulength);
   return RawUncompress(compressed, n, string_as_array(uncompressed));
 }
+
 
 // A Writer that drops everything on the floor and just does validation
 class SnappyDecompressionValidator {
@@ -1255,7 +1064,7 @@ class SnappyDecompressionValidator {
   size_t produced_;
 
  public:
-  inline SnappyDecompressionValidator() : expected_(0), produced_(0) { }
+  inline SnappyDecompressionValidator() : produced_(0) { }
   inline void SetExpectedLength(size_t len) {
     expected_ = len;
   }
@@ -1270,24 +1079,16 @@ class SnappyDecompressionValidator {
     return false;
   }
   inline bool AppendFromSelf(size_t offset, size_t len) {
-    // See SnappyArrayWriter::AppendFromSelf for an explanation of
-    // the "offset - 1u" trick.
-    if (produced_ <= offset - 1u) return false;
+    if (produced_ <= offset - 1u) return false;  // -1u catches offset==0
     produced_ += len;
     return produced_ <= expected_;
   }
-  inline void Flush() {}
 };
 
 bool IsValidCompressedBuffer(const char* compressed, size_t n) {
   ByteArraySource reader(compressed, n);
   SnappyDecompressionValidator writer;
-  return InternalUncompress(&reader, &writer);
-}
-
-bool IsValidCompressed(Source* compressed) {
-  SnappyDecompressionValidator writer;
-  return InternalUncompress(compressed, &writer);
+  return InternalUncompress(&reader, &writer, kuint32max);
 }
 
 void RawCompress(const char* input,
@@ -1313,241 +1114,6 @@ size_t Compress(const char* input, size_t input_length, string* compressed) {
   return compressed_length;
 }
 
-// -----------------------------------------------------------------------
-// Sink interface
-// -----------------------------------------------------------------------
-
-// A type that decompresses into a Sink. The template parameter
-// Allocator must export one method "char* Allocate(int size);", which
-// allocates a buffer of "size" and appends that to the destination.
-template <typename Allocator>
-class SnappyScatteredWriter {
-  Allocator allocator_;
-
-  // We need random access into the data generated so far.  Therefore
-  // we keep track of all of the generated data as an array of blocks.
-  // All of the blocks except the last have length kBlockSize.
-  vector<char*> blocks_;
-  size_t expected_;
-
-  // Total size of all fully generated blocks so far
-  size_t full_size_;
-
-  // Pointer into current output block
-  char* op_base_;       // Base of output block
-  char* op_ptr_;        // Pointer to next unfilled byte in block
-  char* op_limit_;      // Pointer just past block
-
-  inline size_t Size() const {
-    return full_size_ + (op_ptr_ - op_base_);
-  }
-
-  bool SlowAppend(const char* ip, size_t len);
-  bool SlowAppendFromSelf(size_t offset, size_t len);
-
- public:
-  inline explicit SnappyScatteredWriter(const Allocator& allocator)
-      : allocator_(allocator),
-        full_size_(0),
-        op_base_(NULL),
-        op_ptr_(NULL),
-        op_limit_(NULL) {
-  }
-
-  inline void SetExpectedLength(size_t len) {
-    assert(blocks_.empty());
-    expected_ = len;
-  }
-
-  inline bool CheckLength() const {
-    return Size() == expected_;
-  }
-
-  // Return the number of bytes actually uncompressed so far
-  inline size_t Produced() const {
-    return Size();
-  }
-
-  inline bool Append(const char* ip, size_t len) {
-    size_t avail = op_limit_ - op_ptr_;
-    if (len <= avail) {
-      // Fast path
-      memcpy(op_ptr_, ip, len);
-      op_ptr_ += len;
-      return true;
-    } else {
-      return SlowAppend(ip, len);
-    }
-  }
-
-  inline bool TryFastAppend(const char* ip, size_t available, size_t length) {
-    char* op = op_ptr_;
-    const int space_left = op_limit_ - op;
-    if (length <= 16 && available >= 16 + kMaximumTagLength &&
-        space_left >= 16) {
-      // Fast path, used for the majority (about 95%) of invocations.
-      UNALIGNED_STORE64(op, UNALIGNED_LOAD64(ip));
-      UNALIGNED_STORE64(op + 8, UNALIGNED_LOAD64(ip + 8));
-      op_ptr_ = op + length;
-      return true;
-    } else {
-      return false;
-    }
-  }
-
-  inline bool AppendFromSelf(size_t offset, size_t len) {
-    // See SnappyArrayWriter::AppendFromSelf for an explanation of
-    // the "offset - 1u" trick.
-    if (offset - 1u < op_ptr_ - op_base_) {
-      const size_t space_left = op_limit_ - op_ptr_;
-      if (space_left >= len + kMaxIncrementCopyOverflow) {
-        // Fast path: src and dst in current block.
-        IncrementalCopyFastPath(op_ptr_ - offset, op_ptr_, len);
-        op_ptr_ += len;
-        return true;
-      }
-    }
-    return SlowAppendFromSelf(offset, len);
-  }
-
-  // Called at the end of the decompress. We ask the allocator
-  // write all blocks to the sink.
-  inline void Flush() { allocator_.Flush(Produced()); }
-};
-
-template<typename Allocator>
-bool SnappyScatteredWriter<Allocator>::SlowAppend(const char* ip, size_t len) {
-  size_t avail = op_limit_ - op_ptr_;
-  while (len > avail) {
-    // Completely fill this block
-    memcpy(op_ptr_, ip, avail);
-    op_ptr_ += avail;
-    assert(op_limit_ - op_ptr_ == 0);
-    full_size_ += (op_ptr_ - op_base_);
-    len -= avail;
-    ip += avail;
-
-    // Bounds check
-    if (full_size_ + len > expected_) {
-      return false;
-    }
-
-    // Make new block
-    size_t bsize = min<size_t>(kBlockSize, expected_ - full_size_);
-    op_base_ = allocator_.Allocate(bsize);
-    op_ptr_ = op_base_;
-    op_limit_ = op_base_ + bsize;
-    blocks_.push_back(op_base_);
-    avail = bsize;
-  }
-
-  memcpy(op_ptr_, ip, len);
-  op_ptr_ += len;
-  return true;
-}
-
-template<typename Allocator>
-bool SnappyScatteredWriter<Allocator>::SlowAppendFromSelf(size_t offset,
-                                                         size_t len) {
-  // Overflow check
-  // See SnappyArrayWriter::AppendFromSelf for an explanation of
-  // the "offset - 1u" trick.
-  const size_t cur = Size();
-  if (offset - 1u >= cur) return false;
-  if (expected_ - cur < len) return false;
-
-  // Currently we shouldn't ever hit this path because Compress() chops the
-  // input into blocks and does not create cross-block copies. However, it is
-  // nice if we do not rely on that, since we can get better compression if we
-  // allow cross-block copies and thus might want to change the compressor in
-  // the future.
-  size_t src = cur - offset;
-  while (len-- > 0) {
-    char c = blocks_[src >> kBlockLog][src & (kBlockSize-1)];
-    Append(&c, 1);
-    src++;
-  }
-  return true;
-}
-
-class SnappySinkAllocator {
- public:
-  explicit SnappySinkAllocator(Sink* dest): dest_(dest) {}
-  ~SnappySinkAllocator() {}
-
-  char* Allocate(int size) {
-    Datablock block(new char[size], size);
-    blocks_.push_back(block);
-    return block.data;
-  }
-
-  // We flush only at the end, because the writer wants
-  // random access to the blocks and once we hand the
-  // block over to the sink, we can't access it anymore.
-  // Also we don't write more than has been actually written
-  // to the blocks.
-  void Flush(size_t size) {
-    size_t size_written = 0;
-    size_t block_size;
-    for (int i = 0; i < blocks_.size(); ++i) {
-      block_size = min<size_t>(blocks_[i].size, size - size_written);
-      dest_->AppendAndTakeOwnership(blocks_[i].data, block_size,
-                                    &SnappySinkAllocator::Deleter, NULL);
-      size_written += block_size;
-    }
-    blocks_.clear();
-  }
-
- private:
-  struct Datablock {
-    char* data;
-    size_t size;
-    Datablock(char* p, size_t s) : data(p), size(s) {}
-  };
-
-  static void Deleter(void* arg, const char* bytes, size_t size) {
-    delete[] bytes;
-  }
-
-  Sink* dest_;
-  vector<Datablock> blocks_;
-
-  // Note: copying this object is allowed
-};
-
-size_t UncompressAsMuchAsPossible(Source* compressed, Sink* uncompressed) {
-  SnappySinkAllocator allocator(uncompressed);
-  SnappyScatteredWriter<SnappySinkAllocator> writer(allocator);
-  InternalUncompress(compressed, &writer);
-  return writer.Produced();
-}
-
-bool Uncompress(Source* compressed, Sink* uncompressed) {
-  // Read the uncompressed length from the front of the compressed input
-  SnappyDecompressor decompressor(compressed);
-  uint32 uncompressed_len = 0;
-  if (!decompressor.ReadUncompressedLength(&uncompressed_len)) {
-    return false;
-  }
-
-  char c;
-  size_t allocated_size;
-  char* buf = uncompressed->GetAppendBufferVariable(
-      1, uncompressed_len, &c, 1, &allocated_size);
-
-  // If we can get a flat buffer, then use it, otherwise do block by block
-  // uncompression
-  if (allocated_size >= uncompressed_len) {
-    SnappyArrayWriter writer(buf);
-    bool result = InternalUncompressAllTags(
-        &decompressor, &writer, uncompressed_len);
-    uncompressed->Append(buf, writer.Produced());
-    return result;
-  } else {
-    SnappySinkAllocator allocator(uncompressed);
-    SnappyScatteredWriter<SnappySinkAllocator> writer(allocator);
-    return InternalUncompressAllTags(&decompressor, &writer, uncompressed_len);
-  }
-}
 
 } // end namespace snappy
+
