@@ -18,6 +18,7 @@
 -export([compress/1, decompress/1]).
 -export([uncompressed_length/1, is_valid/1]).
 
+-compile(no_native).
 -on_load(init/0).
 
 
